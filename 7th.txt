@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecurePortal - Login</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 400px;
+            margin: 50px auto;
+            padding: 20px;
+            border: 1px solid #ccc;
+            background-color: #f9f9f9;
+        }
+        input, button {
+            width: 100%;
+            padding: 10px;
+            margin: 5px 0;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .error {
+            color: red;
+            font-weight: bold;
+        }
+        .success {
+            color: green;
+            font-weight: bold;
+        }
+        #captcha {
+            display: none;
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+        }
+        #mfa {
+            display: none;
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+        }
+        #status {
+            margin-top: 15px;
+            padding: 10px;
+            text-align: center;
+            min-height: 20px;
+        }
+    </style>
+</head>
+<body>
+    <h2>SecurePortal Login</h2>
+    <form id="loginForm">
+        <input type="text" id="username" placeholder="Username" required>
+        <input type="password" id="password" placeholder="Password" required>
+        <button type="submit">Login</button>
+        <p style="font-size: 12px; color: #666;">Demo credentials: demoUser / StrongPass2025!</p>
+    </form>
+    <div id="captcha">
+        <p>Too many login attempts detected. Please solve the CAPTCHA:</p>
+        <p>Solve: <span id="question"></span> = ?
+            <input type="number" id="answer" size="3" style="width: 60px;">
+        </p>
+        <button onclick="checkCaptcha()">Submit CAPTCHA</button>
+        <div id="captchaMsg"></div>
+    </div>
+    <div id="mfa">
+        <p>Multi-Factor Authentication Required</p>
+        <p>Enter MFA Code:</p>
+        <input type="text" id="mfaCode" placeholder="Enter 6-digit code" required>
+        <button onclick="verifyMFA()">Verify MFA</button>
+        <p style="font-size: 12px; color: #666;">Demo code: 123456</p>
+    </div>
+    <div id="status"></div>
+    <hr style="margin-top: 30px;">
+    <div style="margin-top: 20px; padding: 15px; background-color: #f0f0f0; border-radius: 4px;">
+        <h3 style="margin-top: 0;">Authentication Logs</h3>
+        <button onclick="downloadLogs()" style="background-color: #2196F3; margin-bottom: 10px;">Download Logs as Text File</button>
+        <button onclick="clearLogs()" style="background-color: #f44336; margin-left: 5px; margin-bottom: 10px;">Clear Logs</button>
+        <div id="logOutput" style="border: 1px solid #ccc; padding: 10px; background-color: white; max-height: 300px; overflow-y: auto; font-size: 11px; font-family: monospace; white-space: pre-wrap; word-wrap: break-word; line-height: 1.4;">
+            [Logs will appear here...]
+        </div>
+    </div>
+
+    <script>
+        // ===== LOG STORAGE SYSTEM =====
+        let authLogs = [];
+
+        // Custom logging function to capture logs in both console and file
+        function addLog(message, data = null, level = 'INFO') {
+            const timestamp = new Date().toLocaleTimeString();
+            let logEntry = `[${timestamp}] [${level}] ${message}`;
+
+            if (data) {
+                logEntry += '\n' + JSON.stringify(data, null, 2);
+            }
+
+            authLogs.push(logEntry);
+            updateLogDisplay();
+
+            // Also log to browser console
+            if (level === 'ERROR') {
+                console.error(message, data);
+            } else if (level === 'SUCCESS') {
+                console.log('%c' + message, 'color: green; font-weight: bold;', data);
+            } else if (level === 'WARNING') {
+                console.warn(message, data);
+            } else {
+                console.log(message, data);
+            }
+        }
+
+        function updateLogDisplay() {
+            const logOutput = document.getElementById('logOutput');
+            logOutput.textContent = authLogs.join('\n\n');
+            logOutput.scrollTop = logOutput.scrollHeight; // Auto-scroll to bottom
+        }
+
+        function downloadLogs() {
+            if (authLogs.length === 0) {
+                alert('No logs to download. Try logging in first.');
+                return;
+            }
+
+            const logsText = authLogs.join('\n\n');
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const filename = `authentication_logs_${timestamp}.txt`;
+
+            const element = document.createElement('a');
+            element.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(logsText));
+            element.setAttribute('download', filename);
+            element.style.display = 'none';
+            document.body.appendChild(element);
+            element.click();
+            document.body.removeChild(element);
+
+            addLog('Logs downloaded to file: ' + filename, null, 'INFO');
+        }
+
+        function clearLogs() {
+            if (authLogs.length === 0) {
+                alert('No logs to clear.');
+                return;
+            }
+            authLogs = [];
+            document.getElementById('logOutput').textContent = '[Logs will appear here...]';
+            console.log('Logs cleared');
+        }
+
+        // ===== APPLICATION INITIALIZATION =====
+        let attempts = 0;
+        let captchaAttempts = 0;
+        const MAX_ATTEMPTS = 3;
+        const MAX_CAPTCHA_ATTEMPTS = 5;
+        const demoSalt = 'randomSalt2025';  // Unique per user in real DB
+
+        // FIXED: Hash order now matches hashPassword() function
+        // Password: 'StrongPass2025!' + salt: 'randomSalt2025demoUser'
+        const demoStoredHash = CryptoJS.SHA256('StrongPass2025!' + demoSalt + 'demoUser').toString();
+
+        addLog('Application Initialized', null, 'INFO');
+        addLog('Configuration Loaded', {
+            maxLoginAttempts: MAX_ATTEMPTS,
+            maxCaptchaAttempts: MAX_CAPTCHA_ATTEMPTS,
+            demoSalt: demoSalt,
+            demoStoredHash: demoStoredHash
+        }, 'INFO');
+
+        // Strong password validation
+        function isStrongPassword(pwd) {
+            const minLength = pwd.length >= 12;
+            const hasUppercase = /[A-Z]/.test(pwd);
+            const hasLowercase = /[a-z]/.test(pwd);
+            const hasNumber = /\d/.test(pwd);
+            const hasSpecialChar = /[^A-Za-z0-9]/.test(pwd);
+
+            const isStrong = minLength && hasUppercase && hasLowercase && hasNumber && hasSpecialChar;
+            addLog('Password Validation Check', {
+                passwordLength: pwd.length,
+                minLength: 12,
+                hasUppercase,
+                hasLowercase,
+                hasNumber,
+                hasSpecialChar,
+                isValid: isStrong
+            }, isStrong ? 'SUCCESS' : 'WARNING');
+            return isStrong;
+        }
+
+        // Hash password with salt (simulated - use bcrypt on server in production)
+        function hashPassword(username, pwd) {
+            const salt = demoSalt + username;  // Per-user salt
+            const hash = CryptoJS.SHA256(pwd + salt).toString();
+            addLog('Password Hash Generated', {
+                username,
+                salt,
+                computedHash: hash.substring(0, 32) + '...',
+                hashAlgorithm: 'SHA256'
+            }, 'INFO');
+            return hash;
+        }
+
+        // CAPTCHA generator
+        function generateCaptcha() {
+            const a = Math.floor(Math.random() * 10) + 1;
+            const b = Math.floor(Math.random() * 10) + 1;
+            document.getElementById('question').textContent = `${a} + ${b}`;
+            document.getElementById('answer').value = '';
+            document.getElementById('captchaMsg').textContent = '';
+            captchaAttempts = 0;
+            addLog('CAPTCHA Generated', {
+                question: `${a} + ${b}`,
+                correctAnswer: a + b
+            }, 'INFO');
+        }
+
+        function checkCaptcha() {
+            const ans = parseInt(document.getElementById('answer').value);
+            const q = document.getElementById('question').textContent.split(' + ');
+            const correctAnswer = parseInt(q[0]) + parseInt(q[1]);
+
+            captchaAttempts++;
+            const isCorrect = ans === correctAnswer;
+
+            addLog('CAPTCHA Attempt', {
+                userAnswer: ans,
+                correctAnswer,
+                attemptNumber: captchaAttempts,
+                maxAttempts: MAX_CAPTCHA_ATTEMPTS,
+                result: isCorrect ? 'CORRECT' : 'INCORRECT'
+            }, isCorrect ? 'SUCCESS' : 'WARNING');
+
+            if (isCorrect) {
+                document.getElementById('captchaMsg').textContent = 'CAPTCHA Passed! Please log in again.';
+                document.getElementById('captchaMsg').className = 'success';
+                document.getElementById('loginForm').style.display = 'block';
+                document.getElementById('captcha').style.display = 'none';
+                attempts = 0;  // Reset login attempts after CAPTCHA success
+                document.getElementById('username').value = '';
+                document.getElementById('password').value = '';
+                document.getElementById('status').textContent = '';
+                addLog('CAPTCHA Security Challenge Passed', null, 'SUCCESS');
+            } else {
+                document.getElementById('captchaMsg').textContent = `Wrong answer. Try again (${captchaAttempts}/${MAX_CAPTCHA_ATTEMPTS})`;
+                document.getElementById('captchaMsg').className = 'error';
+
+                if (captchaAttempts >= MAX_CAPTCHA_ATTEMPTS) {
+                    document.getElementById('captchaMsg').textContent = 'CAPTCHA attempts exceeded. Please refresh the page.';
+                    document.getElementById('answer').disabled = true;
+                    addLog('CAPTCHA Max Attempts Exceeded', {
+                        attempts: captchaAttempts,
+                        maxAllowed: MAX_CAPTCHA_ATTEMPTS
+                    }, 'ERROR');
+                }
+            }
+        }
+
+        function verifyMFA() {
+            const mfaCode = document.getElementById('mfaCode').value;
+            const status = document.getElementById('status');
+            const isValid = mfaCode === '123456';
+
+            addLog('MFA Code Verification Attempt', {
+                submittedCode: mfaCode === '123456' ? 'VALID' : 'INVALID',
+                timestamp: new Date().toISOString()
+            }, isValid ? 'SUCCESS' : 'ERROR');
+
+            // IMPORTANT: In production, MFA must be verified on the server, not the client
+            // This is only for demonstration purposes
+            if (isValid) {
+                addLog('FULL AUTHENTICATION SUCCESSFUL', {
+                    allChecksPassed: true,
+                    passwordValidation: 'PASSED',
+                    hashComparison: 'MATCHED',
+                    mfaVerification: 'PASSED',
+                    finalStatus: 'USER_AUTHENTICATED'
+                }, 'SUCCESS');
+                status.innerHTML = '<span class="success">✓ Login Successful! Welcome to SecurePortal.</span>';
+                document.getElementById('mfa').style.display = 'none';
+                document.getElementById('loginForm').style.display = 'block';
+                document.getElementById('username').value = '';
+                document.getElementById('password').value = '';
+            } else {
+                addLog('MFA Verification Failed - Access Denied', {
+                    submittedCode: 'INVALID',
+                    reason: 'Code does not match expected value'
+                }, 'ERROR');
+                status.innerHTML = '<span class="error">✗ Invalid MFA Code. Access Denied.</span>';
+            }
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value.trim();
+            const pwd = document.getElementById('password').value;
+            const status = document.getElementById('status');
+
+            addLog('Login Attempt Submitted', {
+                username,
+                attemptNumber: attempts + 1,
+                maxAttempts: MAX_ATTEMPTS
+            }, 'INFO');
+
+            // Password strength validation
+            if (!isStrongPassword(pwd)) {
+                addLog('Login Failed - Weak Password', {
+                    reason: 'Password does not meet strength requirements',
+                    requirements: {
+                        minLength: '12 characters',
+                        uppercase: 'At least 1',
+                        lowercase: 'At least 1',
+                        number: 'At least 1',
+                        specialCharacter: 'At least 1'
+                    }
+                }, 'ERROR');
+                status.innerHTML = '<span class="error">✗ Weak password! Requirements: 12+ chars, uppercase, lowercase, number, symbol</span>';
+                return;
+            }
+
+            addLog('Password Strength Validation Passed', null, 'SUCCESS');
+
+            // Check if already locked due to too many attempts
+            if (attempts >= MAX_ATTEMPTS) {
+                addLog('Account Locked - Max Login Attempts Exceeded', {
+                    failedAttempts: attempts,
+                    maxAllowed: MAX_ATTEMPTS,
+                    action: 'CAPTCHA challenge initiated'
+                }, 'ERROR');
+                document.getElementById('loginForm').style.display = 'none';
+                document.getElementById('captcha').style.display = 'block';
+                generateCaptcha();
+                status.innerHTML = '<span class="error">✗ Account locked. Too many login attempts. Solve CAPTCHA to continue.</span>';
+                return;
+            }
+
+            attempts++;
+
+            const computedHash = hashPassword(username, pwd);
+
+            addLog('Hash Comparison', {
+                storedHash: demoStoredHash.substring(0, 32) + '...',
+                computedHash: computedHash.substring(0, 32) + '...',
+                hashesMatch: computedHash === demoStoredHash
+            }, 'INFO');
+
+            // Check credentials
+            if (username === 'demoUser' && computedHash === demoStoredHash) {
+                addLog('Credentials Verified Successfully', {
+                    username,
+                    hashMatch: true,
+                    nextStep: 'MFA Required'
+                }, 'SUCCESS');
+                document.getElementById('loginForm').style.display = 'none';
+                document.getElementById('mfa').style.display = 'block';
+                document.getElementById('mfaCode').value = '';
+                status.innerHTML = '<span class="success">✓ Password Valid! Enter MFA code.</span>';
+            } else {
+                addLog('Login Failed - Invalid Credentials', {
+                    username,
+                    usernameValid: username === 'demoUser',
+                    passwordValid: computedHash === demoStoredHash,
+                    attemptNumber: attempts,
+                    attemptsRemaining: MAX_ATTEMPTS - attempts
+                }, 'ERROR');
+                status.innerHTML = `<span class="error">✗ Invalid credentials (${attempts}/${MAX_ATTEMPTS} attempts)</span>`;
+            }
+        });
+    </script>
+</body>
+</html>
